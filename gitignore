@@ -1,0 +1,6 @@
+data/
+worksync
+*.exe
+*.o
+.env
+.env.*
