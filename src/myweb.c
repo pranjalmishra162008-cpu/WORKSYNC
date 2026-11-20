@@ -4,25 +4,25 @@
  *
  * Features:
  *   - Company registration with logo, browser-tab title, tagline and colours
- *   - Each company gets its own address:  https://worksync.com/w/<company-name>-pm
- *     (and <company-name>.PUBLIC_HOST / <company-name>.localhost if DNS points there)
+ *   - Each company gets its own address:  https://<your-host>/w/<company-name>-pm
  *   - Employees with post, salary, daily task target; company-issued login ID + password
  *   - Employee login: clock in/out, task log -> work time and efficiency tracking
  *   - Resources with photos, monthly bill (resources + payroll)
- *   - Growth & funds: funding received, revenue, expenses, cash balance, runway,
- *     month-over-month revenue growth, headcount
+ *   - Growth & funds: funding received, revenue, expenses, cash balance, runway
+ *   - Contact us page (company address, phone, email)
+ *   - Theme presets, light/dark/cream modes, corner and header styles
+ *   - Site font and company-name font, case, size, weight and slant
  *
  * Windows (MinGW-w64) : gcc -O2 -o cpbl.exe cpbl.c -lws2_32
  * Windows (VS prompt)  : cl /O2 cpbl.c
  * Linux / macOS        : gcc -O2 -o cpbl cpbl.c
- * Run   : cpbl
- *         Public address is set by PUBLIC_SCHEME / PUBLIC_HOST below.
- *         Put nginx/Caddy on ports 80/443 and forward to 127.0.0.1:8080
- *         (pass the Host header). Local testing: http://localhost:8080
+ * Run   : cpbl          (listens on port 8080)
+ *         Links shown to the owner are built from the address the browser used,
+ *         so PUBLIC_HOST below is only a fallback.
  * Data  : stored in ./data
- * NOTE  : passwords use a simple hash and there is no HTTPS in this program. Put it
- *         behind a reverse proxy with TLS and swap the hash for bcrypt/argon2 before
- *         using it with real customers. Change SECRET below.
+ * NOTE  : passwords use a simple hash. Put it behind a reverse proxy with TLS and
+ *         swap the hash for bcrypt/argon2 before using it with real customers.
+ *         Change SECRET below.
  */
 #define _GNU_SOURCE
 #define _CRT_SECURE_NO_WARNINGS
@@ -57,21 +57,44 @@ static char *strcasestr(const char *h, const char *n) {
 #endif
 
 #define PORT    8080
-/* ---- Public address of WorkSync. Change PUBLIC_HOST to your real domain (no scheme). ---- */
-#define PUBLIC_HOST   "harmless-suitably-glider.ngrok-free.dev"   /* company URLs become https://worksync.com/w/<company-name>-pm */
-#define PUBLIC_SCHEME "https"          /* needs a TLS certificate on your reverse proxy (nginx/Caddy) */
+/* Fallback only (used when a request has no Host header). */
+#define PUBLIC_HOST   "localhost"
+#define PUBLIC_SCHEME "https"
 #define MAXBODY (8 * 1024 * 1024)
 #define SECRET  "change-this-secret"
 #define INITIALS "pm"                  /* owner initials (PRANJAL MISHRA), added to every public link */
 #define APPNAME "WorkSync"
 static const char *CAT[] = { "", "Equipment", "Software", "Space", "People" };
 
+/* ---- look and feel options ---- */
+static const char *FONTS[]  = {
+    "'Helvetica Neue',Arial,sans-serif",
+    "Georgia,'Times New Roman',serif",
+    "'Playfair Display','Cormorant Garamond',Georgia,serif",
+    "'Trebuchet MS','Segoe UI',Verdana,sans-serif",
+    "'Courier New',Consolas,monospace",
+    "'Brush Script MT','Segoe Script',cursive" };
+static const char *FNAMES[] = { "Modern sans", "Classic serif", "Elegant serif", "Friendly sans", "Typewriter", "Handwritten" };
+static const char *CASES[]  = { "none", "uppercase", "lowercase", "capitalize" };
+static const char *CASEN[]  = { "As typed", "UPPERCASE", "lowercase", "Title Case" };
+static const char *SIZES[]  = { "20px", "26px", "34px", "44px" };
+static const char *SIZEN[]  = { "Small", "Medium", "Large", "Extra large" };
+static const char *MODEN[]  = { "Light", "Dark", "Warm cream" };
+static const char *RADN[]   = { "Sharp corners", "Soft corners", "Round and friendly" };
+static const char *HDRN[]   = { "Solid colour", "Colour gradient", "Light and clean" };
+typedef struct { const char *name, *pri, *acc; int mode; } Preset;
+static const Preset PRE[] = {
+    { "Midnight Gold", "#12203a", "#a8802f", 0 }, { "Ocean",       "#0b3c5d", "#1d9bd1", 0 },
+    { "Forest",        "#14452f", "#7fb927", 0 }, { "Sunset",      "#5b1e3a", "#ff7a45", 0 },
+    { "Violet",        "#2e1a5e", "#9b6bff", 0 }, { "Night Mint",  "#1f2933", "#2ec4a6", 1 },
+    { "Rose Cream",    "#7a1f3d", "#e85d8a", 2 }, { "Graphite",    "#111111", "#4b5563", 0 } };
+
 typedef struct { int id; char name[64], email[96], slug[48]; unsigned long ph; } User;
 typedef struct { int id, cat, qty, photo; double cost; char name[64], month[8]; } Res;
 typedef struct { int id, type; double amt; char month[8], note[64]; } Fund;   /* type 1 funding, 2 revenue */
 
 static char out[1 << 17]; static int ol;
-static char g_host[100];
+static char g_host[100], g_proto[8];
 static void ap(const char *f, ...) {
     va_list a; va_start(a, f);
     if (ol < (int)sizeof out - 1) ol += vsnprintf(out + ol, sizeof out - ol, f, a);
@@ -111,6 +134,7 @@ static int param(const char *b, const char *k, char *o, size_t n) {
     }
     return 0;
 }
+static int ci(const char *s, int hi) { int v = atoi(s); return v < 0 ? 0 : v > hi ? hi : v; }
 static void slugify(const char *s, char *o, size_t n) {
     size_t i = 0; int dash = 0;
     for (; *s && i + 1 < n; s++) {
@@ -183,12 +207,17 @@ static void save_fund(int uid, Fund *f, int n) {
 typedef struct { int n, target; char name[64], post[40], join[8]; double sal; unsigned long ph; } Emp;
 typedef struct { double hrs; int days, tasks, open; long since; } Stat;
 static char g_acc[8] = "#a8802f", g_pri[8] = "#12203a", g_tab[64], g_tag[80], g_brand[64];
-static int g_uid;
+static char g_slug[48], g_caddr[160], g_cphone[40], g_cmail[96];
+static int g_uid, g_font, g_nfont, g_ncase, g_nsize, g_nbold, g_nital, g_mode, g_rad, g_hdr;
 
 static int okcol(const char *c) {
     int i; if (strlen(c) != 7 || c[0] != '#') return 0;
     for (i = 1; i < 7; i++) if (!isxdigit((unsigned char)c[i])) return 0;
     return 1;
+}
+static int dark_col(const char *c) {          /* 1 if the colour is dark, so it needs white text */
+    int r, g, b; if (sscanf(c + 1, "%2x%2x%2x", &r, &g, &b) != 3) return 1;
+    return (r * 299 + g * 587 + b * 114) / 1000 < 150;
 }
 static void rdline(FILE *f, char *b, size_t n) {
     char t[256];
@@ -196,16 +225,36 @@ static void rdline(FILE *f, char *b, size_t n) {
     t[strcspn(t, "\r\n")] = 0;
     strncpy(b, t, n - 1); b[n - 1] = 0;
 }
+static int rdint(FILE *f, int hi, int def) {
+    char t[32]; int v; rdline(f, t, sizeof t);
+    if (!t[0]) return def;
+    v = atoi(t); return (v < 0 || v > hi) ? def : v;
+}
 static void apply_prof(int uid) {
     char p[64], a[8] = "", b[8] = ""; FILE *f; User t;
-    strcpy(g_acc, "#a8802f"); strcpy(g_pri, "#12203a"); g_tab[0] = g_tag[0] = g_brand[0] = 0; g_uid = uid;
-    if (uid && load_user(uid, 0, 0, &t)) strcpy(g_brand, t.name);
+    strcpy(g_acc, "#a8802f"); strcpy(g_pri, "#12203a");
+    g_tab[0] = g_tag[0] = g_brand[0] = g_slug[0] = g_caddr[0] = g_cphone[0] = g_cmail[0] = 0; g_uid = uid;
+    g_font = 0; g_nfont = 2; g_ncase = 0; g_nsize = 1; g_nbold = 1; g_nital = 0; g_mode = 0; g_rad = 1; g_hdr = 0;
+    if (uid && load_user(uid, 0, 0, &t)) { strcpy(g_brand, t.name); strcpy(g_slug, t.slug); }
     sprintf(p, "data/prof_%d.txt", uid);
     if (uid && (f = fopen(p, "r"))) {
         rdline(f, a, sizeof a); rdline(f, b, sizeof b); rdline(f, g_tab, sizeof g_tab); rdline(f, g_tag, sizeof g_tag);
         if (okcol(a)) strcpy(g_acc, a);
         if (okcol(b)) strcpy(g_pri, b);
         fclose(f);
+    }
+    if (uid) {
+        sprintf(p, "data/style_%d.txt", uid);
+        if ((f = fopen(p, "r"))) {
+            g_font = rdint(f, 5, 0); g_nfont = rdint(f, 5, 2); g_ncase = rdint(f, 3, 0); g_nsize = rdint(f, 3, 1);
+            g_nbold = rdint(f, 1, 1); g_nital = rdint(f, 1, 0); g_mode = rdint(f, 2, 0); g_rad = rdint(f, 2, 1); g_hdr = rdint(f, 2, 0);
+            fclose(f);
+        }
+        sprintf(p, "data/contact_%d.txt", uid);
+        if ((f = fopen(p, "r"))) {
+            rdline(f, g_caddr, sizeof g_caddr); rdline(f, g_cphone, sizeof g_cphone); rdline(f, g_cmail, sizeof g_cmail);
+            fclose(f);
+        }
     }
 }
 static void month_now(char *m) { time_t t = time(0); strftime(m, 8, "%Y-%m", localtime(&t)); }
@@ -282,62 +331,106 @@ static void redirect(int fd, const char *to, const char *cookie) {
 }
 
 /* ---------- pages ---------- */
+/* Colours come from CSS variables, which head() fills in from the company's theme. */
 static const char *CSS =
-"<style>:root{--ink:#12203a;--ink2:#1c2f52;--brass:#a8802f;--stone:#eef0f2;--line:#d5d9df;--mut:#5b667a}"
-"*{box-sizing:border-box}body{margin:0;background:var(--stone);color:var(--ink);font:16px/1.6 'Helvetica Neue',Arial,sans-serif}"
-"h1,h2,h3,.logo{font-family:'Playfair Display','Cormorant Garamond',Georgia,serif;font-weight:600;letter-spacing:.01em}"
-"a{color:var(--brass)}header{background:var(--ink);color:#fff;padding:18px 6vw;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;border-bottom:3px solid var(--brass)}"
-"header a{color:#e9dfc7;text-decoration:none;margin-left:22px}.logo{font-size:26px;color:#fff;margin:0}"
+"<style>*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-size:16px;line-height:1.6}"
+"h1,h2,h3,.logo{font-weight:600;letter-spacing:.01em}"
+"a{color:var(--brass)}header{background:var(--hbg);color:var(--hfg);padding:18px 6vw;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-bottom:3px solid var(--brass)}"
+"header a{color:var(--hfg);opacity:.85;text-decoration:none;margin-left:22px}header a:hover{opacity:1;text-decoration:underline}"
+".logo{font-size:26px;color:var(--hfg);margin:0}"
 "main{max-width:1000px;margin:0 auto;padding:36px 6vw}.hero{display:grid;grid-template-columns:1.2fr 1fr;gap:48px;align-items:center;min-height:70vh}"
 ".hero h1{font-size:clamp(36px,5vw,60px);line-height:1.1;margin:0 0 16px}.hero p{color:var(--mut);max-width:44ch}"
-".panel{background:#fff;border:1px solid var(--line);padding:28px;box-shadow:0 18px 40px -26px rgba(18,32,58,.55);overflow-x:auto}"
-"label{display:block;font-size:14px;color:var(--mut);margin:12px 0 4px}input,select{width:100%;padding:10px 12px;border:1px solid var(--line);background:#fbfbfc;font:inherit;color:var(--ink)}"
+".panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--rad);padding:28px;box-shadow:0 18px 40px -26px rgba(0,0,0,.45);overflow-x:auto}"
+"label{display:block;font-size:14px;color:var(--mut);margin:12px 0 4px}"
+"input,select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:var(--rad);background:var(--inp);font:inherit;color:var(--txt)}"
 "input[type=color]{padding:2px;height:42px}"
 "input:focus,select:focus,button:focus-visible{outline:2px solid var(--brass);outline-offset:1px}"
-"button,.btn{background:var(--ink);color:#fff;border:0;padding:11px 22px;font:inherit;cursor:pointer;margin-top:18px;text-decoration:none;display:inline-block}"
-"button:hover,.btn:hover{background:var(--brass)}.ghost{background:none;color:var(--mut);padding:4px 8px;margin:0;border:1px solid var(--line)}"
+"button,.btn{background:var(--brass);color:var(--bfg);border:0;border-radius:var(--brad);padding:11px 22px;font:inherit;cursor:pointer;margin-top:18px;text-decoration:none;display:inline-block}"
+"button:hover,.btn:hover{filter:brightness(1.12)}.ghost{background:none;color:var(--mut);padding:4px 8px;margin:0;border:1px solid var(--line)}"
+".sws{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:8px}"
+".sw{margin:0;padding:8px 10px;border:1px solid var(--line);background:var(--inp);color:var(--txt);display:flex;align-items:center;gap:8px;font-size:13px}"
+".sw:hover{filter:none;border-color:var(--brass)}.sw i{width:34px;height:20px;border-radius:4px;display:inline-block}"
 ".row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}table{width:100%;border-collapse:collapse;margin-top:8px}"
 "th{text-align:left;font-weight:600;color:var(--mut);font-size:14px}th,td{padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:middle}"
-"td img{width:52px;height:52px;object-fit:cover;border:1px solid var(--line)}.num{text-align:right}.tot td{font-weight:700;border-top:2px solid var(--ink);border-bottom:0}"
-".kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}.kpi div{border:1px solid var(--line);padding:14px;background:#fbfbfc}"
+"td img{width:52px;height:52px;object-fit:cover;border:1px solid var(--line);border-radius:var(--rad)}.num{text-align:right}.tot td{font-weight:700;border-top:2px solid var(--txt);border-bottom:0}"
+".kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}.kpi div{border:1px solid var(--line);border-radius:var(--rad);padding:14px;background:var(--inp)}"
 ".kpi b{display:block;font-size:22px}.kpi span{color:var(--mut);font-size:13px}.pos{color:#1d6b3a}.neg{color:#8b1e1e}"
-".err{color:#8b1e1e;margin:0 0 8px}.stack>*+*{margin-top:28px}footer{text-align:center;color:var(--mut);font-size:13px;padding:30px}"
-"@media(max-width:760px){.hero{grid-template-columns:1fr}}@media print{header,.noprint,footer{display:none}body{background:#fff}.panel{box-shadow:none;border:0}}</style>";
+".err{color:#b03030;margin:0 0 8px}.stack>*+*{margin-top:28px}footer{text-align:center;color:var(--mut);font-size:13px;padding:30px}"
+"@media(max-width:760px){.hero{grid-template-columns:1fr}}"
+"@media print{header,.noprint,footer{display:none}body,.panel{background:#fff!important;color:#000!important}.panel{box-shadow:none;border:0}}</style>";
 
-/* Public address of a company: local requests keep the local host, everything else uses PUBLIC_HOST */
-static void ap_url(const char *slug) {
+/* "https://host" of the address the browser used (works on Render, ngrok, localhost, your own domain) */
+static void ap_base(void) {
     int local = g_host[0] && (strstr(g_host, "localhost") || strstr(g_host, "127.0.0.1"));
-    if (local) { ap("http://"); esc(g_host); }
-    else ap(PUBLIC_SCHEME "://" PUBLIC_HOST);
-    ap("/w/"); esc(slug);
+    if (!g_host[0]) { ap(PUBLIC_SCHEME "://" PUBLIC_HOST); return; }
+    ap("%s://", g_proto[0] ? g_proto : (local ? "http" : "https")); esc(g_host);
 }
+static void ap_url(const char *slug) { ap_base(); ap("/w/"); esc(slug); }
 
+/* in: 0 plain, 1 owner tabs, 2 employee tabs, 3 home tabs, 4 company/public tabs */
 static void head(const char *title, int in) {
+    const char *bg = "#eef0f2", *pn = "#ffffff", *tx = "#12203a", *ln = "#d5d9df", *mu = "#5b667a", *ip = "#fbfbfc";
+    static const char *rad[] = { "0px", "10px", "18px" };
+    static const char *brad[] = { "0px", "8px", "999px" };
+    const char *hfg, *bfg; char hbg[140];
+    if (g_mode == 1) { bg = "#0f141c"; pn = "#18202c"; tx = "#e8ecf2"; ln = "#2c3646"; mu = "#9aa6ba"; ip = "#101722"; }
+    else if (g_mode == 2) { bg = "#f6f1e7"; pn = "#fffdf8"; tx = "#2b2418"; ln = "#e3d9c6"; mu = "#7a6e58"; ip = "#fbf7ee"; }
+    if (g_hdr == 2) { snprintf(hbg, sizeof hbg, "var(--panel)"); hfg = tx; }
+    else {
+        if (g_hdr == 1) snprintf(hbg, sizeof hbg, "linear-gradient(120deg,%s,%s)", g_pri, g_acc);
+        else snprintf(hbg, sizeof hbg, "%s", g_pri);
+        hfg = dark_col(g_pri) ? "#ffffff" : "#111111";
+    }
+    bfg = dark_col(g_acc) ? "#ffffff" : "#111111";
     ap("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>");
     esc(title); ap(" | "); esc(g_tab[0] ? g_tab : (g_brand[0] ? g_brand : APPNAME));
     ap("</title>");
     if (g_uid) ap("<link rel=icon href='/logo?u=%d'>", g_uid);
-    ap("%s<style>:root{--brass:%s;--ink:%s}</style></head><body><header><p class=logo>", CSS, g_acc, g_pri);
+    ap("%s<style>:root{--brass:%s;--ink:%s;--bg:%s;--panel:%s;--txt:%s;--line:%s;--mut:%s;--inp:%s;--rad:%s;--brad:%s;--hfg:%s;--bfg:%s;--hbg:%s}"
+       "body{font-family:%s}h1,h2,h3{font-family:%s}"
+       ".logo{font-family:%s;text-transform:%s;font-size:%s;font-weight:%d;font-style:%s}%s</style></head><body><header><p class=logo>",
+       CSS, g_acc, g_pri, bg, pn, tx, ln, mu, ip, rad[g_rad], brad[g_rad], hfg, bfg, hbg,
+       FONTS[g_font], FONTS[g_font],
+       FONTS[g_nfont], CASES[g_ncase], SIZES[g_nsize], g_nbold ? 700 : 400, g_nital ? "italic" : "normal",
+       g_mode == 1 ? ".pos{color:#5fd48a}.neg,.err{color:#ff8a8a}" : "");
     if (g_uid) ap("<img src='/logo?u=%d' alt='' onerror='this.remove()' style='height:34px;vertical-align:middle;margin-right:12px'>", g_uid);
     esc(g_brand[0] ? g_brand : APPNAME);
-    if (g_tag[0]) { ap("<small style='font:13px sans-serif;color:#e9dfc7;margin-left:14px'>"); esc(g_tag); ap("</small>"); }
+    if (g_tag[0]) { ap("<small style='font:13px sans-serif;font-style:normal;text-transform:none;letter-spacing:0;opacity:.8;margin-left:14px'>"); esc(g_tag); ap("</small>"); }
     ap("</p>");
-    if (in == 1) ap("<nav><a href=/app>Workspace</a><a href=/team>Team</a><a href=/track>Work tracking</a><a href=/finance>Growth &amp; funds</a><a href=/bill>Monthly bill</a><a href=/settings>Settings</a><a href=/logout>Sign out</a></nav>");
+    if (in == 1) ap("<nav><a href=/app>Workspace</a><a href=/team>Team</a><a href=/track>Work tracking</a><a href=/finance>Growth &amp; funds</a><a href=/bill>Monthly bill</a><a href=/contact>Contact us</a><a href=/settings>Settings</a><a href=/logout>Sign out</a></nav>");
     if (in == 3) ap("<style>html{scroll-behavior:smooth}</style><nav><a href=#register>Register company</a><a href=#owner>Owner sign in</a><a href=#employees>Employee sign in</a></nav>");
-    if (in == 2) ap("<nav><a href=/me>My work</a><a href=/elogout>Sign out</a></nav>");
+    if (in == 2) ap("<nav><a href=/me>My work</a><a href=/contact>Contact us</a><a href=/elogout>Sign out</a></nav>");
+    if (in == 4) {
+        ap("<nav>");
+        if (g_slug[0]) ap("<a href='/w/%s'>Employee sign-in</a>", g_slug);
+        if (g_uid) ap("<a href='/contact?c=%d'>Contact us</a>", g_uid);
+        ap("<a href=/owner>Owner sign-in</a></nav>");
+    }
     ap("</header><main>");
 }
-static void foot(void) { ap("</main><footer>&copy; 2026 "); esc(g_brand[0] ? g_brand : APPNAME); ap(". Powered by " APPNAME ". All rights reserved by PRANJAL MISHRA.</footer></body></html>"); }
+static void foot(void) {
+    ap("</main><footer>");
+    if (g_uid && (g_cphone[0] || g_cmail[0])) {
+        ap("<div>Contact: ");
+        if (g_cphone[0]) esc(g_cphone);
+        if (g_cphone[0] && g_cmail[0]) ap(" &middot; ");
+        if (g_cmail[0]) esc(g_cmail);
+        ap("</div>");
+    }
+    ap("&copy; 2026 "); esc(g_brand[0] ? g_brand : APPNAME); ap(". Powered by " APPNAME ". All rights reserved by PRANJAL MISHRA.</footer></body></html>");
+}
 
 static void page_home(int fd, const char *err) {
     apply_prof(0); ol = 0; head("Welcome", 3);
     ap("<section class=hero><div><h1>Your company, in sync.</h1>"
-       "<p>Register your company to get its own " APPNAME " address, your logo and colours, an employee login for every team member with work-time and efficiency tracking, and a live view of growth and funds.</p><p><a href=#employees>Employee? Sign in here</a></p></div>"
+       "<p>Register your company to get its own " APPNAME " address, your logo, colours and fonts, an employee login for every team member with work-time and efficiency tracking, and a live view of growth and funds.</p></div>"
        "<div class=stack><div class=panel id=register><h2>Register your company</h2>");
     if (err) { ap("<p class=err>"); esc(err); ap("</p>"); }
     ap("<form id=reg method=post action=/register><label>Company name</label><input name=name required maxlength=60>"
        "<label>Web address name (optional)</label><input name=addr maxlength=40 placeholder='startupmanager'>"
-       "<p style='color:var(--mut);font-size:13px;margin:4px 0 0'>Your address: " PUBLIC_SCHEME "://" PUBLIC_HOST "/w/<b>name</b>-" INITIALS ". Leave blank to use your company name.</p>"
+       "<p style='color:var(--mut);font-size:13px;margin:4px 0 0'>Your address: ");
+    ap_base();
+    ap("/w/<b>name</b>-" INITIALS ". Leave blank to use your company name.</p>"
        "<label>Email</label><input name=email type=email required><label>Password</label><input name=pass type=password minlength=6 required>"
        "<label>Company logo (optional)</label><input id=lg type=file accept='image/*'>"
        "<label>Browser tab title (optional)</label><input name=tab maxlength=60 placeholder='e.g. Acme Portal'>"
@@ -348,7 +441,7 @@ static void page_home(int fd, const char *err) {
        "<label>Password</label><input name=pass type=password required><button>Sign in</button></form></div></div></section>"
        "<section id=employees style='margin-top:40px'><div class=panel style='max-width:520px;margin:0 auto'>"
        "<h2>Employee sign-in</h2><p style='color:var(--mut)'>For team members. Use the Login ID and password given by your company "
-       "(format: companyID-employeeID, e.g. 3-1). You can also sign in from your company's own page at " PUBLIC_SCHEME "://" PUBLIC_HOST "/w/&lt;company-name&gt; (for example " PUBLIC_SCHEME "://" PUBLIC_HOST "/w/startupmanager-" INITIALS ").</p>"
+       "(the Login ID looks like companyID-employeeID, for example 3-1). If you open your company's own address, your Employee ID alone (for example 1) is enough.</p>"
        "<form method=post action=/elogin><label>Login ID</label><input name=lid placeholder='e.g. 3-1' required>"
        "<label>Password</label><input name=pass type=password required><button>Employee sign in</button></form></div></section>"
        "<script>document.getElementById('reg').onsubmit=async function(e){e.preventDefault();"
@@ -359,24 +452,35 @@ static void page_home(int fd, const char *err) {
 }
 /* company's own branded employee sign-in page: /w/<slug> */
 static void page_company(int fd, User *c, const char *err) {
-    apply_prof(c->id); ol = 0; head("Employee sign-in", 0);
+    apply_prof(c->id); ol = 0; head("Employee sign-in", 4);
     ap("<div class=panel style='max-width:440px;margin:40px auto;text-align:center'>"
        "<img src='/logo?u=%d' alt='' onerror='this.remove()' style='max-height:90px;max-width:100%%;margin-bottom:10px'>", c->id);
     ap("<h2>Welcome to "); esc(c->name); ap("</h2><p style='color:var(--mut)'>Employee sign-in</p>");
     if (err) { ap("<p class=err>"); esc(err); ap("</p>"); }
     ap("<form method=post action=/elogin style='text-align:left'><input type=hidden name=co value=%d>"
        "<label>Employee ID (given by your company)</label><input name=lid placeholder='e.g. 1' required>"
-       "<label>Password</label><input name=pass type=password required><button>Sign in</button></form>"
-       "<p><a href=/owner>Company owner sign-in</a></p></div>", c->id);
+       "<label>Password</label><input name=pass type=password required><button>Sign in</button></form></div>", c->id);
     foot(); html(fd);
+}
+static void page_contact(int fd, User *c, int mode) {
+    apply_prof(c->id); ol = 0; head("Contact us", mode);
+    ap("<div class=panel style='max-width:560px;margin:30px auto'><h1>Contact us</h1><p style='color:var(--mut)'>Get in touch with "); esc(c->name); ap(".</p>");
+    if (!g_caddr[0] && !g_cphone[0] && !g_cmail[0]) ap("<p>Contact details have not been added yet.</p>");
+    else {
+        ap("<table>");
+        if (g_caddr[0]) { ap("<tr><th>Address<td>"); esc(g_caddr); ap("</tr>"); }
+        if (g_cphone[0]) { ap("<tr><th>Phone<td><a href='tel:"); esc(g_cphone); ap("'>"); esc(g_cphone); ap("</a></tr>"); }
+        if (g_cmail[0]) { ap("<tr><th>Email<td><a href='mailto:"); esc(g_cmail); ap("'>"); esc(g_cmail); ap("</a></tr>"); }
+        ap("</table>");
+    }
+    if (mode == 1) ap("<p style='color:var(--mut);font-size:14px'>You can change these details in Settings.</p>");
+    ap("</div>"); foot(); html(fd);
 }
 
 static void page_app(int fd, User *u) {
     Res r[500]; int n = load_res(u->id, r, 500), i; char m[8]; month_now(m);
     ol = 0; head("Workspace", 1);
-    ap("<div class=stack><div><h1>"); esc(u->name); ap("</h1><p style='color:var(--mut)'>Your resources and their quantities.</p>");
-    ap("<p style='color:var(--mut)'>Your " APPNAME " address (employees sign in here): <a href='/w/%s'>", u->slug); ap_url(u->slug);
-    ap("</a></p></div>"
+    ap("<div class=stack><div><h1>"); esc(u->name); ap("</h1><p style='color:var(--mut)'>Your resources and their quantities.</p></div>"
        "<div class=panel><h2>Add a resource</h2><form id=f><div class=row><div><label>Name</label><input name=name required maxlength=60></div>"
        "<div><label>Category</label><select name=cat><option value=1>Equipment<option value=2>Software<option value=3>Space<option value=4>People</select></div>"
        "<div><label>Quantity</label><input name=qty type=number min=0 value=1 required></div>"
@@ -396,7 +500,7 @@ static void page_app(int fd, User *u) {
         }
         ap("</table>");
     }
-    ap("</div><a class=btn href=/bill>View monthly bill</a></div>"
+    ap("</div></div>"
        "<script>document.getElementById('f').onsubmit=async function(e){e.preventDefault();var d=new URLSearchParams(new FormData(this));"
        "var r=await fetch('/add',{method:'POST',body:d});var id=(await r.text()).trim();var f=document.getElementById('ph').files[0];"
        "if(f&&/^\\d+$/.test(id))await fetch('/photo?rid='+id,{method:'POST',body:f});location.reload()}</script>");
@@ -486,11 +590,11 @@ static void page_finance(int fd, User *u) {
 
 /* ---------- employee pages ---------- */
 static void page_elogin(int fd, const char *err) {
-    apply_prof(0); ol = 0; head("Employee sign-in", 0);
+    apply_prof(0); ol = 0; head("Employee sign-in", 4);
     ap("<div class=panel style='max-width:420px;margin:40px auto'><h2>Employee sign-in</h2>");
     if (err) { ap("<p class=err>"); esc(err); ap("</p>"); }
     ap("<form method=post action=/elogin><label>Login ID (given by your company)</label><input name=lid placeholder='e.g. 3-1' required>"
-       "<label>Password</label><input name=pass type=password required><button>Sign in</button></form><p><a href=/owner>Back</a></p></div>");
+       "<label>Password</label><input name=pass type=password required><button>Sign in</button></form></div>");
     foot(); html(fd);
 }
 static void page_me(int fd, Emp *e, int cu) {
@@ -515,9 +619,8 @@ static void page_team(int fd, User *u) {
        "<div><label>Monthly salary (Rs.)</label><input name=salary type=number min=0 step=0.01 required></div>"
        "<div><label>Target tasks per day</label><input name=target type=number min=1 value=5 required></div>"
        "<div><label>Password for the employee</label><input name=pass minlength=6 required></div></div>"
-       "<button>Add employee</button></form><p style='color:var(--mut)'>Each employee gets an Employee ID. Share it with their password; they sign in at <a href='/w/%s'>", u->slug);
-    ap_url(u->slug);
-    ap("</a>.</p></div><div class=panel><h2>Employees</h2>");
+       "<button>Add employee</button></form><p style='color:var(--mut)'>Each employee gets a Login ID (shown in the table below). "
+       "Give them the Login ID and the password you set. Your company address for employees is in Settings.</p></div><div class=panel><h2>Employees</h2>");
     for (i = 0; i < n; i++) {
         pay += e[i].sal;
         for (j = 0; j < np; j++) if (!strcmp(po[j], e[i].post)) break;
@@ -528,9 +631,9 @@ static void page_team(int fd, User *u) {
     else {
         ap("<p>Headcount: %d. Monthly payroll: Rs. %.2f.<br>", n, pay);
         for (j = 0; j < np; j++) { esc(po[j]); ap(": %d%s", pc[j], j + 1 < np ? ", " : ""); }
-        ap("</p><table><tr><th>Employee ID<th>Name<th>Post<th>Joined<th class=num>Salary<th></tr>");
+        ap("</p><table><tr><th>Employee ID<th>Login ID<th>Name<th>Post<th>Joined<th class=num>Salary<th></tr>");
         for (i = 0; i < n; i++) {
-            ap("<tr><td>%d<td>", e[i].n); esc(e[i].name); ap("<td>"); esc(e[i].post);
+            ap("<tr><td>%d<td><b>%d-%d</b><td>", e[i].n, u->id, e[i].n); esc(e[i].name); ap("<td>"); esc(e[i].post);
             ap("<td>%s<td class=num>%.2f<td><form method=post action=/empdel?rid=%d><button class=ghost>Remove</button></form></tr>",
                strcmp(e[i].join, "0000-00") ? e[i].join : "-", e[i].sal, e[i].n);
         }
@@ -555,18 +658,61 @@ static void page_track(int fd, User *u, const char *m) {
     }
     ap("</div>"); foot(); html(fd);
 }
+
+/* ---------- settings ---------- */
+static void opt(int v, const char *label, int sel) { ap("<option value=%d%s>%s", v, sel ? " selected" : "", label); }
+static void fopt(int v, int sel) { ap("<option value=%d data-f=\"%s\"%s>%s", v, FONTS[v], sel ? " selected" : "", FNAMES[v]); }
 static void page_settings(int fd, User *u) {
+    int i;
     ol = 0; head("Settings", 1);
-    ap("<div class=stack><h1>Brand and workspace</h1><div class=panel><p>Your " APPNAME " address: <a href='/w/%s'>", u->slug); ap_url(u->slug);
-    ap("</a></p><form id=sf><div class=row>"
-       "<div><label>Browser tab title</label><input name=tab maxlength=60 value='"); esc(g_tab);
+    ap("<div class=stack><h1>Brand and workspace</h1><form id=sf class=stack onchange='pv()'>"
+       "<div class=panel><h2>Company address</h2><p style='color:var(--mut)'>Share this address with your employees so they can sign in. Select it to copy.</p>"
+       "<input readonly onclick='this.select()' value='");
+    ap_url(u->slug);
+    ap("'></div>"
+       "<div class=panel><h2>Identity</h2><div class=row><div><label>Browser tab title</label><input name=tab maxlength=60 value='"); esc(g_tab);
     ap("'></div><div><label>Tagline</label><input name=tag maxlength=78 value='"); esc(g_tag);
-    ap("'></div><div><label>Primary colour</label><input name=pri type=color value=%s></div>"
+    ap("'></div><div><label>New logo (optional)</label><input id=lg type=file accept='image/*'></div></div></div>"
+       "<div class=panel><h2>Colour theme</h2><p style='color:var(--mut)'>Pick a ready-made palette, then fine-tune the colours below.</p><div class=sws>");
+    for (i = 0; i < (int)(sizeof PRE / sizeof PRE[0]); i++)
+        ap("<button type=button class=sw onclick=\"pick('%s','%s',%d)\"><i style='background:linear-gradient(135deg,%s 50%%,%s 50%%)'></i>%s</button>",
+           PRE[i].pri, PRE[i].acc, PRE[i].mode, PRE[i].pri, PRE[i].acc, PRE[i].name);
+    ap("</div><div class=row style='margin-top:10px'><div><label>Primary colour</label><input name=pri type=color value=%s></div>"
        "<div><label>Accent colour</label><input name=acc type=color value=%s></div>"
-       "<div><label>New logo (optional)</label><input id=lg type=file accept='image/*'></div></div><button>Save settings</button></form></div></div>"
-       "<script>document.getElementById('sf').onsubmit=async function(e){e.preventDefault();"
+       "<div><label>Page mode</label><select name=mode>", g_pri, g_acc);
+    for (i = 0; i < 3; i++) opt(i, MODEN[i], g_mode == i);
+    ap("</select></div><div><label>Corners</label><select name=rad>");
+    for (i = 0; i < 3; i++) opt(i, RADN[i], g_rad == i);
+    ap("</select></div><div><label>Header style</label><select name=hdr>");
+    for (i = 0; i < 3; i++) opt(i, HDRN[i], g_hdr == i);
+    ap("</select></div></div></div>"
+       "<div class=panel><h2>Fonts and company name</h2><div class=row><div><label>Site font</label><select name=font>");
+    for (i = 0; i < 6; i++) fopt(i, g_font == i);
+    ap("</select></div><div><label>Company name font</label><select name=nfont>");
+    for (i = 0; i < 6; i++) fopt(i, g_nfont == i);
+    ap("</select></div><div><label>Company name letters</label><select name=ncase>");
+    for (i = 0; i < 4; i++) opt(i, CASEN[i], g_ncase == i);
+    ap("</select></div><div><label>Company name size</label><select name=nsize>");
+    for (i = 0; i < 4; i++) opt(i, SIZEN[i], g_nsize == i);
+    ap("</select></div><div><label>Company name weight</label><select name=nbold>");
+    opt(1, "Bold", g_nbold == 1); opt(0, "Light", g_nbold == 0);
+    ap("</select></div><div><label>Company name slant</label><select name=nital>");
+    opt(0, "Upright", g_nital == 0); opt(1, "Italic", g_nital == 1);
+    ap("</select></div></div><p style='margin-top:16px;color:var(--mut)'>Preview: <span id=pv>"); esc(g_brand[0] ? g_brand : APPNAME);
+    ap("</span></p></div>"
+       "<div class=panel><h2>Contact us details</h2><p style='color:var(--mut)'>Shown on your Contact us page to employees and visitors.</p><div class=row>"
+       "<div><label>Company address</label><input name=caddr maxlength=150 value='"); esc(g_caddr);
+    ap("'></div><div><label>Phone number</label><input name=cphone type=tel maxlength=38 value='"); esc(g_cphone);
+    ap("'></div><div><label>Company email</label><input name=cmail type=email maxlength=90 value='"); esc(g_cmail);
+    ap("'></div></div></div><div><button>Save settings</button></div></form></div>"
+       "<script>function pick(p,a,m){var d=document.getElementById('sf').elements;d['pri'].value=p;d['acc'].value=a;d['mode'].value=m}"
+       "function pv(){var d=document.getElementById('sf').elements,s=document.getElementById('pv'),f=d['nfont'],"
+       "c=['none','uppercase','lowercase','capitalize'],z=['20px','26px','34px','44px'];"
+       "s.style.fontFamily=f.options[f.selectedIndex].getAttribute('data-f');s.style.textTransform=c[d['ncase'].value];"
+       "s.style.fontSize=z[d['nsize'].value];s.style.fontWeight=d['nbold'].value==1?700:400;s.style.fontStyle=d['nital'].value==1?'italic':'normal'}"
+       "pv();document.getElementById('sf').onsubmit=async function(e){e.preventDefault();"
        "await fetch('/settings',{method:'POST',body:new URLSearchParams(new FormData(this))});"
-       "var f=document.getElementById('lg').files[0];if(f)await fetch('/logo',{method:'POST',body:f});location.reload()}</script>", g_pri, g_acc);
+       "var f=document.getElementById('lg').files[0];if(f)await fetch('/logo',{method:'POST',body:f});location.reload()}</script>");
     foot(); html(fd);
 }
 static void serve_img(int fd, const char *p) {
@@ -599,11 +745,15 @@ static void handle(int fd) {
     }
     if (!hl || sscanf(buf, "%7s %127s", meth, path) != 2) goto done;
     body = buf + hl; body[len - hl] = 0;
-    g_host[0] = 0;
+    g_host[0] = 0; g_proto[0] = 0;
     if ((q = strcasestr(buf, "\r\nHost:"))) {
         size_t hn; q += 7; while (*q == ' ') q++;
         hn = strcspn(q, "\r\n"); if (hn >= sizeof g_host) hn = sizeof g_host - 1;
         memcpy(g_host, q, hn); g_host[hn] = 0;
+    }
+    if ((q = strcasestr(buf, "\r\nX-Forwarded-Proto:"))) {
+        q += 20; while (*q == ' ') q++;
+        strcpy(g_proto, !strncasecmp(q, "https", 5) ? "https" : "http");
     }
     q = strchr(path, '?'); if (q) *q++ = 0; else q = path + strlen(path);
     logged = auth(buf, &u); month_now(m); if (logged) apply_prof(u.id);
@@ -626,6 +776,15 @@ static void handle(int fd) {
         char sl[48]; User cu; size_t l = strcspn(path + 3, "/");
         if (l && l < sizeof sl) { memcpy(sl, path + 3, l); sl[l] = 0; } else sl[0] = 0;
         if (sl[0] && load_user(0, 0, sl, &cu)) page_company(fd, &cu, 0);
+        else reply(fd, "404 Not Found", "text/plain", "No such company", 15, 0);
+    }
+    else if (!strcmp(path, "/contact") && !strcmp(meth, "GET")) {
+        /* works for the owner, a signed-in employee, or the public (?c=<company id>) */
+        Emp ce; User cc; int ecu = 0, cid = 0, mode = 4;
+        if (param(q, "c", v, sizeof v)) cid = atoi(v);
+        if (logged && (cid == 0 || cid == u.id)) { cid = u.id; mode = 1; }
+        else if (eauth(buf, &ce, &ecu) && (cid == 0 || cid == ecu)) { cid = ecu; mode = 2; }
+        if (cid > 0 && load_user(cid, 0, 0, &cc)) page_contact(fd, &cc, mode);
         else reply(fd, "404 Not Found", "text/plain", "No such company", 15, 0);
     }
     else if (!strcmp(path, "/register") && !strcmp(meth, "POST")) {
@@ -663,13 +822,18 @@ static void handle(int fd) {
     }
     else if (!strcmp(path, "/elogin") && !strcmp(meth, "GET")) page_elogin(fd, 0);
     else if (!strcmp(path, "/elogin") && !strcmp(meth, "POST")) {
-        char lid[40], pw[64], sal[120], co[16]; Emp *es = malloc(sizeof(Emp) * 200); int eu = 0, en = 0, ne, k, ok = 0, cid, parsed;
-        User cu;
+        /* Accepts "companyID-employeeID" (e.g. 3-1) anywhere, or just the employee number
+           when the form came from the company's own page (hidden field co). */
+        char lid[40], pw[64], sal[120], co[16]; Emp *es = malloc(sizeof(Emp) * 200);
+        int eu = 0, en = 0, ne, k, ok = 0, cid, parsed = 0; User cu;
         param(body, "lid", lid, sizeof lid); param(body, "pass", pw, sizeof pw); param(body, "co", co, sizeof co);
+        { char *s = lid; size_t l; while (*s == ' ') s++; if (s != lid) memmove(lid, s, strlen(s) + 1);
+          l = strlen(lid); while (l && lid[l - 1] == ' ') lid[--l] = 0; }
         cid = atoi(co);
-        if (cid > 0) { eu = cid; en = atoi(lid); parsed = 1; }          /* from company page: plain employee number */
-        else parsed = (sscanf(lid, "%d-%d", &eu, &en) == 2);            /* generic page: companyId-employeeId */
-        if (parsed) {
+        if (strchr(lid, '-')) parsed = (sscanf(lid, "%d-%d", &eu, &en) == 2);
+        else if (cid > 0 && isdigit((unsigned char)lid[0])) { eu = cid; en = atoi(lid); parsed = 1; }
+        if (parsed && cid > 0 && eu != cid) parsed = 0;               /* company page: ID must belong to that company */
+        if (parsed && eu > 0 && en > 0) {
             ne = load_emp(eu, es, 200); snprintf(sal, sizeof sal, "%d-%d%s", eu, en, pw);
             for (k = 0; k < ne && !ok; k++) if (es[k].n == en && es[k].ph == hs(sal)) {
                 etoken(eu, &es[k], tk);
@@ -680,7 +844,7 @@ static void handle(int fd) {
         free(es);
         if (!ok) {
             if (cid > 0 && load_user(cid, 0, 0, &cu)) page_company(fd, &cu, "Employee ID or password is incorrect.");
-            else page_elogin(fd, "Login ID or password is incorrect.");
+            else page_elogin(fd, "Login ID or password is incorrect. Use the Login ID shown by your company, like 3-1.");
         }
     }
     else if (!strcmp(path, "/elogout")) redirect(fd, "/elogin", "Set-Cookie: emp=; Path=/; Max-Age=0\r\n");
@@ -718,12 +882,20 @@ static void handle(int fd) {
     }
     else if (!strcmp(path, "/settings") && !strcmp(meth, "GET")) page_settings(fd, &u);
     else if (!strcmp(path, "/settings") && !strcmp(meth, "POST")) {
-        char a[8], b2[8], t1[64], t2[80], p[64]; FILE *f;
+        char a[8], b2[8], t1[64], t2[80], p[64], z[16], ca[160], cp[40], cm[96]; FILE *f;
+        static const char *keys[] = { "font", "nfont", "ncase", "nsize", "nbold", "nital", "mode", "rad", "hdr" };
+        static const int hi[] = { 5, 5, 3, 3, 1, 1, 2, 2, 2 };
+        int k;
         param(body, "acc", a, sizeof a); param(body, "pri", b2, sizeof b2); param(body, "tab", t1, sizeof t1); param(body, "tag", t2, sizeof t2);
         if (!okcol(a)) { strcpy(a, "#a8802f"); }
         if (!okcol(b2)) { strcpy(b2, "#12203a"); }
         sprintf(p, "data/prof_%d.txt", u.id); f = fopen(p, "w");
         if (f) { fprintf(f, "%s\n%s\n%s\n%s\n", a, b2, t1, t2); fclose(f); }
+        sprintf(p, "data/style_%d.txt", u.id); f = fopen(p, "w");
+        if (f) { for (k = 0; k < 9; k++) { param(body, keys[k], z, sizeof z); fprintf(f, "%d\n", ci(z, hi[k])); } fclose(f); }
+        param(body, "caddr", ca, sizeof ca); param(body, "cphone", cp, sizeof cp); param(body, "cmail", cm, sizeof cm);
+        sprintf(p, "data/contact_%d.txt", u.id); f = fopen(p, "w");
+        if (f) { fprintf(f, "%s\n%s\n%s\n", ca, cp, cm); fclose(f); }
         reply(fd, "200 OK", "text/plain", "ok", 2, 0);
     }
     else if (!strcmp(path, "/logo") && !strcmp(meth, "POST")) {
@@ -793,7 +965,6 @@ int main(void) {
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof on);
     memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(PORT);
     if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 || listen(s, 16) < 0) { perror("bind"); return 1; }
-    printf(APPNAME " listening on port %d (local: http://localhost:%d), public address %s://%s\n",
-           PORT, PORT, PUBLIC_SCHEME, PUBLIC_HOST);
+    printf(APPNAME " listening on port %d (local: http://localhost:%d)\n", PORT, PORT);
     for (;;) { int c = accept(s, 0, 0); if (c < 0) continue; handle(c); CLOSESOCK(c); }
 }
