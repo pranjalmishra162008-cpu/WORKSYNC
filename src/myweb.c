@@ -6,7 +6,10 @@
  *   - Company registration with logo, browser-tab title, tagline and colours
  *   - Each company gets its own address:  https://<your-host>/w/<company-name>-pm
  *   - Employees with post, salary, daily task target; company-issued login ID + password
+ *   - Custom employee Login ID (letters, numbers and @ only) set by the owner
  *   - Employee login: clock in/out, task log -> work time and efficiency tracking
+ *   - Goals: the owner sets goals for each employee separately; they show on the employee's screen
+ *   - Meetings: the owner schedules meetings; employees get an alert 15 minutes before
  *   - Resources with photos, monthly bill (resources + payroll)
  *   - Growth & funds: funding received, revenue, expenses, cash balance, runway
  *   - Contact us page (company address, phone, email)
@@ -64,6 +67,7 @@ static char *strcasestr(const char *h, const char *n) {
 #define SECRET  "change-this-secret"
 #define INITIALS "pm"                  /* owner initials (PRANJAL MISHRA), added to every public link */
 #define APPNAME "WorkSync"
+#define ALERT_SECS 900                 /* employees are alerted this many seconds before a meeting (15 min) */
 static const char *CAT[] = { "", "Equipment", "Software", "Space", "People" };
 
 /* ---- look and feel options ---- */
@@ -144,6 +148,35 @@ static void slugify(const char *s, char *o, size_t n) {
     if (i && o[i - 1] == '-') i--;
     o[i] = 0; if (!i) strcpy(o, "company");
 }
+static void trim(char *s) {
+    size_t l; char *p = s;
+    while (*p == ' ') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    l = strlen(s); while (l && s[l - 1] == ' ') s[--l] = 0;
+}
+static int lideq(const char *a, const char *b) {          /* case-insensitive compare */
+    for (; *a && *b; a++, b++) if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+/* Custom login ID rule: 3-30 characters, only letters, digits and @, at least one letter. */
+static int valid_lid(const char *s) {
+    size_t l = strlen(s), i; int letter = 0;
+    if (l < 3 || l > 30) return 0;
+    for (i = 0; i < l; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) letter = 1;
+        else if (!(c >= '0' && c <= '9') && c != '@') return 0;
+    }
+    return letter;
+}
+static int okdate(const char *s) {                         /* YYYY-MM-DD */
+    int i; if (strlen(s) != 10) return 0;
+    for (i = 0; i < 10; i++) {
+        if (i == 4 || i == 7) { if (s[i] != '-') return 0; }
+        else if (!isdigit((unsigned char)s[i])) return 0;
+    }
+    return 1;
+}
 
 /* ---------- storage ---------- */
 /* users.txt line: id|name|email|hash|slug   (older 4-field lines get slug "c<id>") */
@@ -204,7 +237,7 @@ static void save_fund(int uid, Fund *f, int n) {
 }
 
 /* ---------- branding, employees, time tracking ---------- */
-typedef struct { int n, target; char name[64], post[40], join[8]; double sal; unsigned long ph; } Emp;
+typedef struct { int n, target; char name[64], post[40], join[8], lid[32]; double sal; unsigned long ph; } Emp;
 typedef struct { double hrs; int days, tasks, open; long since; } Stat;
 static char g_acc[8] = "#a8802f", g_pri[8] = "#12203a", g_tab[64], g_tag[80], g_brand[64];
 static char g_slug[48], g_caddr[160], g_cphone[40], g_cmail[96];
@@ -258,20 +291,72 @@ static void apply_prof(int uid) {
     }
 }
 static void month_now(char *m) { time_t t = time(0); strftime(m, 8, "%Y-%m", localtime(&t)); }
+/* emp_<uid>.txt line: n|name|post|salary|target|hash|join|loginid   ("-" = no custom login ID) */
 static int load_emp(int uid, Emp *e, int max) {
-    char p[64], ln[300]; int n = 0, k; FILE *f; sprintf(p, "data/emp_%d.txt", uid); f = fopen(p, "r"); if (!f) return 0;
+    char p[64], ln[360]; int n = 0, k; FILE *f; sprintf(p, "data/emp_%d.txt", uid); f = fopen(p, "r"); if (!f) return 0;
     while (n < max && fgets(ln, sizeof ln, f)) {
-        k = sscanf(ln, "%d|%63[^|]|%39[^|]|%lf|%d|%lu|%7s", &e[n].n, e[n].name, e[n].post, &e[n].sal, &e[n].target, &e[n].ph, e[n].join);
+        e[n].lid[0] = 0;
+        k = sscanf(ln, "%d|%63[^|]|%39[^|]|%lf|%d|%lu|%7[^|]|%31[^|\r\n]", &e[n].n, e[n].name, e[n].post, &e[n].sal,
+                   &e[n].target, &e[n].ph, e[n].join, e[n].lid);
         if (k == 6) strcpy(e[n].join, "0000-00");
+        if (k < 8 || e[n].lid[0] == '-') e[n].lid[0] = 0;
         if (k >= 6) n++;
     }
     fclose(f); return n;
 }
 static void save_emp(int uid, Emp *e, int n) {
     char p[64]; int i; FILE *f; sprintf(p, "data/emp_%d.txt", uid); f = fopen(p, "w"); if (!f) return;
-    for (i = 0; i < n; i++) fprintf(f, "%d|%s|%s|%.2f|%d|%lu|%s\n", e[i].n, e[i].name, e[i].post, e[i].sal, e[i].target, e[i].ph, e[i].join);
+    for (i = 0; i < n; i++) fprintf(f, "%d|%s|%s|%.2f|%d|%lu|%s|%s\n", e[i].n, e[i].name, e[i].post, e[i].sal, e[i].target,
+                                    e[i].ph, e[i].join, e[i].lid[0] ? e[i].lid : "-");
     fclose(f);
 }
+/* Find an employee by custom login ID. cid > 0: only that company; cid == 0: every company. */
+static int find_custom(const char *lid, int cid, int *ru, int *rn) {
+    Emp *es = malloc(sizeof(Emp) * 200); FILE *f = fopen("data/users.txt", "r"); char ln[400]; int id, ne, i, found = 0;
+    if (!f) { free(es); return 0; }
+    while (!found && fgets(ln, sizeof ln, f)) {
+        if (sscanf(ln, "%d", &id) != 1 || (cid > 0 && id != cid)) continue;
+        ne = load_emp(id, es, 200);
+        for (i = 0; i < ne; i++) if (es[i].lid[0] && lideq(es[i].lid, lid)) { *ru = id; *rn = es[i].n; found = 1; break; }
+    }
+    fclose(f); free(es); return found;
+}
+
+/* ---------- goals (owner -> one employee) ---------- */
+typedef struct { int id, emp, done; char due[12], text[200]; } Goal;       /* goal_<uid>.txt: id|emp|done|due|text */
+static int load_goal(int uid, Goal *g, int max) {
+    char p[64], ln[400]; int n = 0; FILE *f; sprintf(p, "data/goal_%d.txt", uid); f = fopen(p, "r"); if (!f) return 0;
+    while (n < max && fgets(ln, sizeof ln, f)) {
+        ln[strcspn(ln, "\r\n")] = 0;
+        if (sscanf(ln, "%d|%d|%d|%11[^|]|%199[^\n]", &g[n].id, &g[n].emp, &g[n].done, g[n].due, g[n].text) == 5) n++;
+    }
+    fclose(f); return n;
+}
+static void save_goal(int uid, Goal *g, int n) {
+    char p[64]; FILE *f; int i; sprintf(p, "data/goal_%d.txt", uid); f = fopen(p, "w"); if (!f) return;
+    for (i = 0; i < n; i++) fprintf(f, "%d|%d|%d|%s|%s\n", g[i].id, g[i].emp, g[i].done, g[i].due, g[i].text);
+    fclose(f);
+}
+
+/* ---------- meetings (who = 0 for all employees, or one employee number) ---------- */
+typedef struct { int id, who, dur; long ts; char title[80], place[100]; } Meet; /* meet_<uid>.txt: id|who|epoch|minutes|title|place */
+static int mcmp(const void *a, const void *b) {
+    long x = ((const Meet *)a)->ts, y = ((const Meet *)b)->ts; return x < y ? -1 : x > y;
+}
+static int load_meet(int uid, Meet *m, int max) {
+    char p[64], ln[400]; int n = 0; FILE *f; sprintf(p, "data/meet_%d.txt", uid); f = fopen(p, "r"); if (!f) return 0;
+    while (n < max && fgets(ln, sizeof ln, f)) {
+        ln[strcspn(ln, "\r\n")] = 0;
+        if (sscanf(ln, "%d|%d|%ld|%d|%79[^|]|%99[^\n]", &m[n].id, &m[n].who, &m[n].ts, &m[n].dur, m[n].title, m[n].place) == 6) n++;
+    }
+    fclose(f); qsort(m, n, sizeof(Meet), mcmp); return n;
+}
+static void save_meet(int uid, Meet *m, int n) {
+    char p[64]; FILE *f; int i; sprintf(p, "data/meet_%d.txt", uid); f = fopen(p, "w"); if (!f) return;
+    for (i = 0; i < n; i++) fprintf(f, "%d|%d|%ld|%d|%s|%s\n", m[i].id, m[i].who, m[i].ts, m[i].dur, m[i].title, m[i].place);
+    fclose(f);
+}
+
 /* payroll for month mo: salaries of employees who joined on or before that month */
 static double payroll(const Emp *e, int n, const char *mo, int *cnt) {
     double s = 0; int i; *cnt = 0;
@@ -397,7 +482,7 @@ static void head(const char *title, int in) {
     esc(g_brand[0] ? g_brand : APPNAME);
     if (g_tag[0]) { ap("<small style='font:13px sans-serif;font-style:normal;text-transform:none;letter-spacing:0;opacity:.8;margin-left:14px'>"); esc(g_tag); ap("</small>"); }
     ap("</p>");
-    if (in == 1) ap("<nav><a href=/app>Workspace</a><a href=/team>Team</a><a href=/track>Work tracking</a><a href=/finance>Growth &amp; funds</a><a href=/bill>Monthly bill</a><a href=/contact>Contact us</a><a href=/settings>Settings</a><a href=/logout>Sign out</a></nav>");
+    if (in == 1) ap("<nav><a href=/app>Workspace</a><a href=/team>Team</a><a href=/goals>Goals</a><a href=/meetings>Meetings</a><a href=/track>Work tracking</a><a href=/finance>Growth &amp; funds</a><a href=/bill>Monthly bill</a><a href=/contact>Contact us</a><a href=/settings>Settings</a><a href=/logout>Sign out</a></nav>");
     if (in == 3) ap("<style>html{scroll-behavior:smooth}</style><nav><a href=#register>Register company</a><a href=#owner>Owner sign in</a><a href=#employees>Employee sign in</a></nav>");
     if (in == 2) ap("<nav><a href=/me>My work</a><a href=/contact>Contact us</a><a href=/elogout>Sign out</a></nav>");
     if (in == 4) {
@@ -407,9 +492,22 @@ static void head(const char *title, int in) {
         ap("<a href=/owner>Owner sign-in</a></nav>");
     }
     ap("</header><main>");
+    if (in == 2)   /* meeting reminders: asks the server every 30 s for meetings starting within 15 minutes */
+        ap("<div id=mal></div><script>(function(){var b=document.getElementById('mal');"
+           "function go(){fetch('/meetalerts').then(function(r){return r.text()}).then(function(t){b.textContent='';"
+           "t.split('\\n').forEach(function(l){var p=l.split('|');if(p.length<5)return;"
+           "var s=+p[2],m=Math.max(1,Math.ceil(s/60)),d=document.createElement('div');d.className='panel';"
+           "d.style.cssText='border-left:6px solid var(--brass);margin-bottom:18px';"
+           "d.textContent='Meeting reminder: '+p[3]+' starts in about '+m+' min'+(p[4]!=='-'?' ('+p[4]+')':'');b.appendChild(d);"
+           "var k='ma'+p[0]+'_'+p[1];try{if(!localStorage.getItem(k)){localStorage.setItem(k,1);"
+           "if(window.Notification&&Notification.permission==='granted')new Notification('Meeting in '+m+' min',{body:p[3]});"
+           "alert('Reminder: meeting '+p[3]+' starts in about '+m+' minutes.')}}catch(e){}})}).catch(function(){})}"
+           "if(window.Notification&&Notification.permission==='default')Notification.requestPermission();"
+           "go();setInterval(go,30000)})()</script>");
 }
 static void foot(void) {
-    ap("</main><footer>");
+    ap("</main><script>document.querySelectorAll('[data-t]').forEach(function(e){e.textContent=new Date(e.getAttribute('data-t')*1000)"
+       ".toLocaleString([],{dateStyle:'medium',timeStyle:'short'})})</script><footer>");
     if (g_uid && (g_cphone[0] || g_cmail[0])) {
         ap("<div>Contact: ");
         if (g_cphone[0]) esc(g_cphone);
@@ -423,7 +521,7 @@ static void foot(void) {
 static void page_home(int fd, const char *err) {
     apply_prof(0); ol = 0; head("Welcome", 3);
     ap("<section class=hero><div><h1>Your company, in sync.</h1>"
-       "<p>Register your company to get its own " APPNAME " address, your logo, colours and fonts, an employee login for every team member with work-time and efficiency tracking, and a live view of growth and funds.</p></div>"
+       "<p>Register your company to get its own " APPNAME " address, your logo, colours and fonts, an employee login for every team member with work-time and efficiency tracking, goals, meetings, and a live view of growth and funds.</p></div>"
        "<div class=stack><div class=panel id=register><h2>Register your company</h2>");
     if (err) { ap("<p class=err>"); esc(err); ap("</p>"); }
     ap("<form id=reg method=post action=/register><label>Company name</label><input name=name required maxlength=60>"
@@ -441,8 +539,8 @@ static void page_home(int fd, const char *err) {
        "<label>Password</label><input name=pass type=password required><button>Sign in</button></form></div></div></section>"
        "<section id=employees style='margin-top:40px'><div class=panel style='max-width:520px;margin:0 auto'>"
        "<h2>Employee sign-in</h2><p style='color:var(--mut)'>For team members. Use the Login ID and password given by your company "
-       "(the Login ID looks like companyID-employeeID, for example 3-1). If you open your company's own address, your Employee ID alone (for example 1) is enough.</p>"
-       "<form method=post action=/elogin><label>Login ID</label><input name=lid placeholder='e.g. 3-1' required>"
+       "(the Login ID is either a custom ID such as priya@acme, or the default companyID-employeeID such as 3-1). If you open your company's own address, your Employee ID alone (for example 1) is enough.</p>"
+       "<form method=post action=/elogin><label>Login ID</label><input name=lid placeholder='e.g. priya@acme or 3-1' required>"
        "<label>Password</label><input name=pass type=password required><button>Employee sign in</button></form></div></section>"
        "<script>document.getElementById('reg').onsubmit=async function(e){e.preventDefault();"
        "var r=await fetch('/register',{method:'POST',body:new URLSearchParams(new FormData(this))});"
@@ -458,7 +556,7 @@ static void page_company(int fd, User *c, const char *err) {
     ap("<h2>Welcome to "); esc(c->name); ap("</h2><p style='color:var(--mut)'>Employee sign-in</p>");
     if (err) { ap("<p class=err>"); esc(err); ap("</p>"); }
     ap("<form method=post action=/elogin style='text-align:left'><input type=hidden name=co value=%d>"
-       "<label>Employee ID (given by your company)</label><input name=lid placeholder='e.g. 1' required>"
+       "<label>Login ID (custom ID, or Employee ID such as 1)</label><input name=lid placeholder='e.g. priya@acme or 1' required>"
        "<label>Password</label><input name=pass type=password required><button>Sign in</button></form></div>", c->id);
     foot(); html(fd);
 }
@@ -593,9 +691,95 @@ static void page_elogin(int fd, const char *err) {
     apply_prof(0); ol = 0; head("Employee sign-in", 4);
     ap("<div class=panel style='max-width:420px;margin:40px auto'><h2>Employee sign-in</h2>");
     if (err) { ap("<p class=err>"); esc(err); ap("</p>"); }
-    ap("<form method=post action=/elogin><label>Login ID (given by your company)</label><input name=lid placeholder='e.g. 3-1' required>"
+    ap("<form method=post action=/elogin><label>Login ID (given by your company)</label><input name=lid placeholder='e.g. priya@acme or 3-1' required>"
        "<label>Password</label><input name=pass type=password required><button>Sign in</button></form></div>");
     foot(); html(fd);
+}
+
+/* ---------- goals page (owner) ---------- */
+static void page_goals(int fd, User *u) {
+    Emp *e = malloc(sizeof(Emp) * 200); Goal *g = malloc(sizeof(Goal) * 500);
+    int ne = load_emp(u->id, e, 200), ng = load_goal(u->id, g, 500), i, j;
+    ol = 0; head("Goals", 1);
+    ap("<div class=stack><div><h1>Goals</h1><p style='color:var(--mut)'>Set a goal for each employee separately. It appears on that employee's own screen, and they can mark it done.</p></div>");
+    if (!ne) ap("<div class=panel><p>Add employees on the Team page first.</p></div>");
+    else {
+        ap("<div class=panel><h2>Set a goal</h2><form method=post action=/goaladd><div class=row><div><label>Employee</label><select name=emp>");
+        for (i = 0; i < ne; i++) { ap("<option value=%d>", e[i].n); esc(e[i].name); ap(" - "); esc(e[i].post); }
+        ap("</select></div><div><label>Deadline (optional)</label><input name=due type=date></div></div>"
+           "<label>Goal</label><input name=text required maxlength=190 placeholder='e.g. Finish the client dashboard by Friday'>"
+           "<button>Assign goal</button></form></div>");
+    }
+    ap("<div class=panel><h2>All goals</h2>");
+    if (!ng) ap("<p>No goals set yet.</p>");
+    else {
+        ap("<table><tr><th>Employee<th>Goal<th>Deadline<th>Status<th></tr>");
+        for (i = 0; i < ng; i++) {
+            for (j = 0; j < ne; j++) if (e[j].n == g[i].emp) break;
+            ap("<tr><td>"); esc(j < ne ? e[j].name : "(removed)"); ap("<td>"); esc(g[i].text);
+            ap("<td>"); esc(g[i].due); ap("<td>%s<td><form method=post action=/goaldel?rid=%d><button class=ghost>Remove</button></form></tr>",
+                                          g[i].done ? "Done" : "Open", g[i].id);
+        }
+        ap("</table>");
+    }
+    ap("</div></div>"); foot(); html(fd); free(e); free(g);
+}
+
+/* ---------- meetings page (owner) ---------- */
+static void page_meetings(int fd, User *u) {
+    Emp *e = malloc(sizeof(Emp) * 200); Meet *mt = malloc(sizeof(Meet) * 300);
+    int ne = load_emp(u->id, e, 200), nm = load_meet(u->id, mt, 300), i, j; long now = (long)time(0);
+    ol = 0; head("Meetings", 1);
+    ap("<div class=stack><div><h1>Meetings</h1><p style='color:var(--mut)'>Schedule a meeting for everyone or for one employee. "
+       "Employees get an alert 15 minutes before it starts (while they have their employee page open). Times are shown in each person's own time zone.</p></div>"
+       "<div class=panel><h2>Schedule a meeting</h2>"
+       "<form method=post action=/meetadd onsubmit=\"this.ts.value=Math.floor(new Date(this.when.value).getTime()/1000)\">"
+       "<input type=hidden name=ts><div class=row>"
+       "<div><label>Title</label><input name=title required maxlength=78></div>"
+       "<div><label>Date and time</label><input name=when type=datetime-local required></div>"
+       "<div><label>Length (minutes)</label><input name=dur type=number min=5 max=600 value=30 required></div>"
+       "<div><label>Who should attend</label><select name=who><option value=0>All employees");
+    for (j = 0; j < ne; j++) { ap("<option value=%d>", e[j].n); esc(e[j].name); }
+    ap("</select></div><div><label>Place or meeting link</label><input name=place maxlength=95></div></div>"
+       "<button>Schedule meeting</button></form></div><div class=panel><h2>All meetings</h2>");
+    if (!nm) ap("<p>No meetings scheduled.</p>");
+    else {
+        ap("<table><tr><th>When<th>Title<th>Length<th>Attendees<th>Place<th>Status<th></tr>");
+        for (i = 0; i < nm; i++) {
+            ap("<tr><td><span data-t=%ld></span><td>", mt[i].ts); esc(mt[i].title);
+            ap("<td>%d min<td>", mt[i].dur);
+            if (!mt[i].who) ap("Everyone");
+            else { for (j = 0; j < ne; j++) if (e[j].n == mt[i].who) break; esc(j < ne ? e[j].name : "(removed)"); }
+            ap("<td>"); esc(strcmp(mt[i].place, "-") ? mt[i].place : "");
+            ap("<td>%s<td><form method=post action=/meetdel?rid=%d><button class=ghost>Remove</button></form></tr>",
+               mt[i].ts + mt[i].dur * 60L < now ? "Finished" : mt[i].ts <= now ? "Happening now" : "Upcoming", mt[i].id);
+        }
+        ap("</table>");
+    }
+    ap("</div></div>"); foot(); html(fd); free(e); free(mt);
+}
+
+/* goals and meetings shown on an employee's own screen */
+static void emp_extras(int cu, const Emp *e) {
+    Goal *g = malloc(sizeof(Goal) * 500); Meet *mt = malloc(sizeof(Meet) * 300);
+    int ng = load_goal(cu, g, 500), nm = load_meet(cu, mt, 300), i, c = 0; long now = (long)time(0);
+    ap("<div class=panel><h2>My goals</h2>");
+    for (i = 0; i < ng; i++) if (g[i].emp == e->n) {
+        if (!c++) ap("<table><tr><th>Goal<th>Deadline<th>Status<th></tr>");
+        ap("<tr><td>"); esc(g[i].text); ap("<td>"); esc(g[i].due);
+        ap("<td>%s<td>", g[i].done ? "Done" : "Open");
+        if (!g[i].done) ap("<form method=post action=/goaldone?rid=%d><button class=ghost>Mark done</button></form>", g[i].id);
+        ap("</tr>");
+    }
+    if (c) ap("</table>"); else ap("<p>No goals have been set for you yet.</p>");
+    ap("</div><div class=panel><h2>Upcoming meetings</h2>"); c = 0;
+    for (i = 0; i < nm; i++) if ((mt[i].who == 0 || mt[i].who == e->n) && mt[i].ts + mt[i].dur * 60L >= now) {
+        if (!c++) ap("<table><tr><th>When<th>Meeting<th>Length<th>Place</tr>");
+        ap("<tr><td><span data-t=%ld></span><td>", mt[i].ts); esc(mt[i].title);
+        ap("<td>%d min<td>", mt[i].dur); esc(strcmp(mt[i].place, "-") ? mt[i].place : ""); ap("</tr>");
+    }
+    if (c) ap("</table>"); else ap("<p>No upcoming meetings.</p>");
+    ap("</div>"); free(g); free(mt);
 }
 static void page_me(int fd, Emp *e, int cu) {
     Stat st; char m[8], t[12]; time_t x;
@@ -606,21 +790,28 @@ static void page_me(int fd, Emp *e, int cu) {
     if (st.open) { x = st.since; strftime(t, sizeof t, "%H:%M", localtime(&x)); ap("<p>Working since %s.</p>", t); }
     ap("<form method=post action=/clock><button>%s</button></form>", st.open ? "Clock out" : "Clock in");
     if (st.open) ap("<form method=post action=/task><button>Log a completed task</button></form>");
-    ap("</div><div class=panel><h2>This month</h2><table><tr><th>Hours worked<th>Days present<th>Tasks done<th>Efficiency</tr>"
+    ap("</div>");
+    emp_extras(cu, e);
+    ap("<div class=panel><h2>This month</h2><table><tr><th>Hours worked<th>Days present<th>Tasks done<th>Efficiency</tr>"
        "<tr><td>%.1f<td>%d<td>%d<td>%.0f%% of target (%d tasks a day)</tr></table></div></div>", st.hrs, st.days, st.tasks, eff(e, &st), e->target);
     foot(); html(fd);
 }
-static void page_team(int fd, User *u) {
+static void page_team(int fd, User *u, int ec) {
     Emp e[200]; int n = load_emp(u->id, e, 200), i, j, np = 0, pc[200]; char po[200][40]; double pay = 0;
     ol = 0; head("Team", 1);
-    ap("<div class=stack><div><h1>Team</h1></div><div class=panel><h2>Add an employee</h2><form method=post action=/empadd><div class=row>"
+    ap("<div class=stack><div><h1>Team</h1></div>");
+    if (ec) ap("<p class=err>%s</p>", ec == 1 ? "Login ID must be 3-30 characters: letters, numbers and @ only (no spaces or other symbols), with at least one letter."
+                                  : ec == 2 ? "That Login ID is already taken. Choose a different one." : "Could not save that Login ID.");
+    ap("<div class=panel><h2>Add an employee</h2><form method=post action=/empadd><div class=row>"
        "<div><label>Name</label><input name=name required maxlength=60></div>"
        "<div><label>Post</label><input name=post required maxlength=38 placeholder='e.g. Developer'></div>"
        "<div><label>Monthly salary (Rs.)</label><input name=salary type=number min=0 step=0.01 required></div>"
        "<div><label>Target tasks per day</label><input name=target type=number min=1 value=5 required></div>"
-       "<div><label>Password for the employee</label><input name=pass minlength=6 required></div></div>"
-       "<button>Add employee</button></form><p style='color:var(--mut)'>Each employee gets a Login ID (shown in the table below). "
-       "Give them the Login ID and the password you set. Your company address for employees is in Settings.</p></div><div class=panel><h2>Employees</h2>");
+       "<div><label>Password for the employee</label><input name=pass minlength=6 required></div>"
+       "<div><label>Custom Login ID (optional)</label><input name=lid maxlength=30 pattern='[A-Za-z0-9@]{3,30}' "
+       "title='Letters, numbers and @ only, at least one letter' placeholder='e.g. priya@acme'></div></div>"
+       "<button>Add employee</button></form><p style='color:var(--mut)'>Each employee can sign in with the default Login ID (shown in the table below, like 3-1) "
+       "or with a custom Login ID you choose: letters, numbers and @ only. Give them the Login ID and the password you set. Your company address for employees is in Settings.</p></div><div class=panel><h2>Employees</h2>");
     for (i = 0; i < n; i++) {
         pay += e[i].sal;
         for (j = 0; j < np; j++) if (!strcmp(po[j], e[i].post)) break;
@@ -633,7 +824,11 @@ static void page_team(int fd, User *u) {
         for (j = 0; j < np; j++) { esc(po[j]); ap(": %d%s", pc[j], j + 1 < np ? ", " : ""); }
         ap("</p><table><tr><th>Employee ID<th>Login ID<th>Name<th>Post<th>Joined<th class=num>Salary<th></tr>");
         for (i = 0; i < n; i++) {
-            ap("<tr><td>%d<td><b>%d-%d</b><td>", e[i].n, u->id, e[i].n); esc(e[i].name); ap("<td>"); esc(e[i].post);
+            ap("<tr><td>%d<td><b>%d-%d</b>", e[i].n, u->id, e[i].n);
+            if (e[i].lid[0]) { ap("<br><b>"); esc(e[i].lid); ap("</b>"); }
+            ap("<form method=post action=/empsetid?rid=%d><input name=lid maxlength=30 placeholder='custom ID' value='", e[i].n); esc(e[i].lid);
+            ap("' style='max-width:150px;padding:4px 8px;margin-top:4px'> <button class=ghost>Set</button></form><td>"); esc(e[i].name);
+            ap("<td>"); esc(e[i].post);
             ap("<td>%s<td class=num>%.2f<td><form method=post action=/empdel?rid=%d><button class=ghost>Remove</button></form></tr>",
                strcmp(e[i].join, "0000-00") ? e[i].join : "-", e[i].sal, e[i].n);
         }
@@ -822,15 +1017,15 @@ static void handle(int fd) {
     }
     else if (!strcmp(path, "/elogin") && !strcmp(meth, "GET")) page_elogin(fd, 0);
     else if (!strcmp(path, "/elogin") && !strcmp(meth, "POST")) {
-        /* Accepts "companyID-employeeID" (e.g. 3-1) anywhere, or just the employee number
-           when the form came from the company's own page (hidden field co). */
+        /* Accepts a custom Login ID (letters/digits/@), "companyID-employeeID" (e.g. 3-1) anywhere,
+           or just the employee number when the form came from the company's own page (hidden field co). */
         char lid[40], pw[64], sal[120], co[16]; Emp *es = malloc(sizeof(Emp) * 200);
         int eu = 0, en = 0, ne, k, ok = 0, cid, parsed = 0; User cu;
         param(body, "lid", lid, sizeof lid); param(body, "pass", pw, sizeof pw); param(body, "co", co, sizeof co);
-        { char *s = lid; size_t l; while (*s == ' ') s++; if (s != lid) memmove(lid, s, strlen(s) + 1);
-          l = strlen(lid); while (l && lid[l - 1] == ' ') lid[--l] = 0; }
+        trim(lid);
         cid = atoi(co);
         if (strchr(lid, '-')) parsed = (sscanf(lid, "%d-%d", &eu, &en) == 2);
+        else if (valid_lid(lid)) parsed = find_custom(lid, cid, &eu, &en);
         else if (cid > 0 && isdigit((unsigned char)lid[0])) { eu = cid; en = atoi(lid); parsed = 1; }
         if (parsed && cid > 0 && eu != cid) parsed = 0;               /* company page: ID must belong to that company */
         if (parsed && eu > 0 && en > 0) {
@@ -843,27 +1038,94 @@ static void handle(int fd) {
         }
         free(es);
         if (!ok) {
-            if (cid > 0 && load_user(cid, 0, 0, &cu)) page_company(fd, &cu, "Employee ID or password is incorrect.");
-            else page_elogin(fd, "Login ID or password is incorrect. Use the Login ID shown by your company, like 3-1.");
+            if (cid > 0 && load_user(cid, 0, 0, &cu)) page_company(fd, &cu, "Login ID or password is incorrect.");
+            else page_elogin(fd, "Login ID or password is incorrect. Use the Login ID given by your company, like priya@acme or 3-1.");
         }
     }
     else if (!strcmp(path, "/elogout")) redirect(fd, "/elogin", "Set-Cookie: emp=; Path=/; Max-Age=0\r\n");
-    else if (!strcmp(path, "/me") || !strcmp(path, "/clock") || !strcmp(path, "/task")) {
+    else if (!strcmp(path, "/me") || !strcmp(path, "/clock") || !strcmp(path, "/task") ||
+             !strcmp(path, "/goaldone") || !strcmp(path, "/meetalerts")) {
         Emp e; int cu = 0; Stat st;
         if (!eauth(buf, &e, &cu)) redirect(fd, "/elogin", 0);
         else {
             stats(cu, e.n, m, &st);
             if (!strcmp(path, "/clock") && !strcmp(meth, "POST")) { logev(cu, e.n, st.open ? 'O' : 'I'); redirect(fd, "/me", 0); }
             else if (!strcmp(path, "/task") && !strcmp(meth, "POST")) { if (st.open) logev(cu, e.n, 'T'); redirect(fd, "/me", 0); }
+            else if (!strcmp(path, "/goaldone") && !strcmp(meth, "POST")) {
+                Goal *g = malloc(sizeof(Goal) * 500); int ng = load_goal(cu, g, 500), i;
+                for (i = 0; i < ng; i++) if (g[i].id == rid && g[i].emp == e.n) g[i].done = 1;
+                save_goal(cu, g, ng); free(g); redirect(fd, "/me", 0);
+            }
+            else if (!strcmp(path, "/meetalerts")) {
+                /* one line per meeting starting within 15 minutes: id|start|seconds left|title|place */
+                Meet *mt = malloc(sizeof(Meet) * 300); int nm = load_meet(cu, mt, 300), i; long now = (long)time(0), d;
+                ol = 0;
+                for (i = 0; i < nm; i++) {
+                    d = mt[i].ts - now;
+                    if ((mt[i].who == 0 || mt[i].who == e.n) && d > 0 && d <= ALERT_SECS)
+                        ap("%d|%ld|%ld|%s|%s\n", mt[i].id, mt[i].ts, d, mt[i].title, mt[i].place);
+                }
+                reply(fd, "200 OK", "text/plain; charset=utf-8", out, ol, "Cache-Control: no-store\r\n"); free(mt);
+            }
             else page_me(fd, &e, cu);
         }
     }
     else if (!logged) redirect(fd, "/", 0);
     else if (!strcmp(path, "/app")) page_app(fd, &u);
     else if (!strcmp(path, "/bill")) page_bill(fd, &u, mm);
-    else if (!strcmp(path, "/team")) page_team(fd, &u);
+    else if (!strcmp(path, "/team")) page_team(fd, &u, param(q, "e", v, sizeof v) ? atoi(v) : 0);
     else if (!strcmp(path, "/track")) page_track(fd, &u, mm);
     else if (!strcmp(path, "/finance")) page_finance(fd, &u);
+    else if (!strcmp(path, "/goals")) page_goals(fd, &u);
+    else if (!strcmp(path, "/meetings")) page_meetings(fd, &u);
+    else if (!strcmp(path, "/goaladd") && !strcmp(meth, "POST")) {
+        Goal *g = malloc(sizeof(Goal) * 501), *x; Emp *es = malloc(sizeof(Emp) * 200);
+        int n = load_goal(u.id, g, 500), ne = load_emp(u.id, es, 200), i, mx = 0, ok = 0;
+        for (i = 0; i < n; i++) if (g[i].id > mx) mx = g[i].id;
+        x = &g[n]; memset(x, 0, sizeof *x); x->id = mx + 1;
+        param(body, "emp", v, sizeof v); x->emp = atoi(v);
+        for (i = 0; i < ne; i++) if (es[i].n == x->emp) ok = 1;
+        param(body, "due", x->due, sizeof x->due); if (!okdate(x->due)) strcpy(x->due, "-");
+        param(body, "text", x->text, sizeof x->text); trim(x->text);
+        if (ok && n < 500 && x->text[0]) save_goal(u.id, g, n + 1);
+        free(g); free(es); redirect(fd, "/goals", 0);
+    }
+    else if (!strcmp(path, "/goaldel") && !strcmp(meth, "POST")) {
+        Goal *g = malloc(sizeof(Goal) * 500); int n = load_goal(u.id, g, 500), i, k = 0;
+        for (i = 0; i < n; i++) if (g[i].id != rid) g[k++] = g[i];
+        save_goal(u.id, g, k); free(g); redirect(fd, "/goals", 0);
+    }
+    else if (!strcmp(path, "/meetadd") && !strcmp(meth, "POST")) {
+        Meet *mt = malloc(sizeof(Meet) * 301), *x; Emp *es = malloc(sizeof(Emp) * 200);
+        int n = load_meet(u.id, mt, 300), ne = load_emp(u.id, es, 200), i, mx = 0, ok = 0;
+        for (i = 0; i < n; i++) if (mt[i].id > mx) mx = mt[i].id;
+        x = &mt[n]; memset(x, 0, sizeof *x); x->id = mx + 1;
+        param(body, "title", x->title, sizeof x->title); trim(x->title);
+        param(body, "ts", v, sizeof v); x->ts = atol(v);
+        param(body, "dur", v, sizeof v); x->dur = atoi(v); if (x->dur < 5 || x->dur > 600) x->dur = 30;
+        param(body, "who", v, sizeof v); x->who = atoi(v);
+        if (x->who == 0) ok = 1; else for (i = 0; i < ne; i++) if (es[i].n == x->who) ok = 1;
+        param(body, "place", x->place, sizeof x->place); trim(x->place); if (!x->place[0]) strcpy(x->place, "-");
+        if (ok && n < 300 && x->title[0] && x->ts > 0) save_meet(u.id, mt, n + 1);
+        free(mt); free(es); redirect(fd, "/meetings", 0);
+    }
+    else if (!strcmp(path, "/meetdel") && !strcmp(meth, "POST")) {
+        Meet *mt = malloc(sizeof(Meet) * 300); int n = load_meet(u.id, mt, 300), i, k = 0;
+        for (i = 0; i < n; i++) if (mt[i].id != rid) mt[k++] = mt[i];
+        save_meet(u.id, mt, k); free(mt); redirect(fd, "/meetings", 0);
+    }
+    else if (!strcmp(path, "/empsetid") && !strcmp(meth, "POST")) {
+        Emp *es = malloc(sizeof(Emp) * 200); int n = load_emp(u.id, es, 200), i, idx = -1, eu, en, err = 0; char li[40];
+        param(body, "lid", li, sizeof li); trim(li);
+        for (i = 0; i < n; i++) if (es[i].n == rid) idx = i;
+        if (idx < 0) err = 3;
+        else if (!li[0]) es[idx].lid[0] = 0;                              /* empty = remove the custom ID */
+        else if (!valid_lid(li)) err = 1;
+        else if (find_custom(li, 0, &eu, &en) && !(eu == u.id && en == rid)) err = 2;
+        else strcpy(es[idx].lid, li);
+        if (!err) save_emp(u.id, es, n);
+        free(es); redirect(fd, err == 1 ? "/team?e=1" : err == 2 ? "/team?e=2" : err ? "/team?e=3" : "/team", 0);
+    }
     else if (!strcmp(path, "/fundadd") && !strcmp(meth, "POST")) {
         Fund *f = malloc(sizeof(Fund) * 501), *x; int n = load_fund(u.id, f, 500), i, mx = 0;
         for (i = 0; i < n; i++) if (f[i].id > mx) mx = f[i].id;
@@ -904,17 +1166,23 @@ static void handle(int fd) {
         reply(fd, "200 OK", "text/plain", "ok", 2, 0);
     }
     else if (!strcmp(path, "/empadd") && !strcmp(meth, "POST")) {
-        Emp *es = malloc(sizeof(Emp) * 201), *x; int n = load_emp(u.id, es, 200), i, mx = 0; char pw[64], sal[120];
+        Emp *es = malloc(sizeof(Emp) * 201), *x; int n = load_emp(u.id, es, 200), i, mx = 0, eu, en, err = 0; char pw[64], sal[120], li[40];
         for (i = 0; i < n; i++) if (es[i].n > mx) mx = es[i].n;
         x = &es[n]; memset(x, 0, sizeof *x); x->n = mx + 1; strcpy(x->join, m);
         param(body, "name", x->name, sizeof x->name); param(body, "post", x->post, sizeof x->post);
         param(body, "salary", v, sizeof v); x->sal = atof(v); if (x->sal < 0) x->sal = 0;
         param(body, "target", v, sizeof v); x->target = atoi(v); if (x->target < 1) x->target = 1;
         param(body, "pass", pw, sizeof pw);
-        if (n < 200 && *x->name && *x->post && strlen(pw) >= 6) {
+        param(body, "lid", li, sizeof li); trim(li);                      /* optional custom Login ID */
+        if (li[0]) {
+            if (!valid_lid(li)) err = 1;
+            else if (find_custom(li, 0, &eu, &en)) err = 2;
+            else strcpy(x->lid, li);
+        }
+        if (!err && n < 200 && *x->name && *x->post && strlen(pw) >= 6) {
             snprintf(sal, sizeof sal, "%d-%d%s", u.id, x->n, pw); x->ph = hs(sal); save_emp(u.id, es, n + 1);
         }
-        free(es); redirect(fd, "/team", 0);
+        free(es); redirect(fd, err == 1 ? "/team?e=1" : err == 2 ? "/team?e=2" : "/team", 0);
     }
     else if (!strcmp(path, "/empdel") && !strcmp(meth, "POST")) {
         Emp *es = malloc(sizeof(Emp) * 200); int n = load_emp(u.id, es, 200), i, k = 0;
